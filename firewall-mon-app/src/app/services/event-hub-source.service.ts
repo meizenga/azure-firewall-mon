@@ -3,8 +3,8 @@ import { Injectable } from '@angular/core';
 import * as Model from '../services/model.service';
 import { LoggingService } from './logging.service';
 
-import { EventHubConsumerClient, earliestEventPosition, latestEventPosition, ReceivedEventData, SubscribeOptions } from "@azure/event-hubs";
-
+import { EventHubConsumerClient, earliestEventPosition, ReceivedEventData, SubscribeOptions } from "@azure/event-hubs";
+import { environment } from 'src/environments/environment';
 
 @Injectable({
   providedIn: 'root'
@@ -30,15 +30,15 @@ export class EventHubSourceService implements Model.IFirewallSource {
   public async start() {
 
     try {
-      this.outputMessage(`connecting consumerClient to azure event hub`);
+      this.outputMessage(`connecting to azure event hub`);
       await new Promise(resolve => setTimeout(resolve, this.defaultSleepTime));
       this.consumerClient = new EventHubConsumerClient(this.model.eventHubConsumerGroup, this.model.eventHubConnection);
       
-      this.outputMessage(`connected! getting partitionIds`);
+      this.outputMessage(`getting partitionIds`);
       await new Promise(resolve => setTimeout(resolve, this.defaultSleepTime));
       const partitionIds = await this.consumerClient.getPartitionIds();
       
-      this.outputMessage(`done! reading events from partitions: ${partitionIds.join(", ")}`);
+      this.outputMessage(`reading events from partitions: ${partitionIds.join(", ")}`);
       await new Promise(resolve => setTimeout(resolve, this.defaultSleepTime));
 
       var subscribeOptions: SubscribeOptions = { startPosition: earliestEventPosition, maxBatchSize: 200 };
@@ -69,9 +69,16 @@ export class EventHubSourceService implements Model.IFirewallSource {
                     case "AzureFirewallNetworkRule":
                     case "AzureFirewallApplicationRule":
                     case "AzureFirewallDnsProxy":    {
-                      row = this.parseAzureFirewallRule(record);
+                      row = this.parseAzureFirewallRuleLegacy(record);
                       break;
                     }
+                    // new format (structured logs)
+                    case "AZFWDnsQuery":
+                    case "AZFWApplicationRule":
+                    case "AZFWNetworkRule":
+                    case "AZFWNatRule":
+                      row = this.parseAzureFirewallRule(record);
+                      break;
                     default: {
                       row = {
                         time: record.time.toString(),
@@ -102,6 +109,11 @@ export class EventHubSourceService implements Model.IFirewallSource {
                 }
                 moreRows++;
                 this.DATA.unshift(row);
+
+                while (this.DATA.length > environment.EventsQueueLength) {
+                  this.DATA.pop();
+                }
+          
               }
 
               this.onDataArrived?.(this.DATA); 
@@ -168,7 +180,7 @@ export class EventHubSourceService implements Model.IFirewallSource {
     this.logginService.logTrace(text);
   }
 
-  private parseAzureFirewallRule(record: Model.AzureFirewallRecord): Model.FirewallDataRow {
+  private parseAzureFirewallRuleLegacy(record: Model.AzureFirewallRecord): Model.FirewallDataRow {
     var row: Model.FirewallDataRow;
 
     try {
@@ -185,7 +197,7 @@ export class EventHubSourceService implements Model.IFirewallSource {
 
           row = {
             time: record.time.toString(),
-            category: "NetworkRule",
+            category: "NetworkRule (legacy)",
             protocol: splitRequest[0],
             sourceip: ipport1[0],
             srcport: ipport1[1],
@@ -204,7 +216,7 @@ export class EventHubSourceService implements Model.IFirewallSource {
 
           row = {
             time: record.time.toString(),
-            category: "NatRule",
+            category: "NATRule (legacy)",
             protocol: split[0],
             sourceip: ipport1[0],
             srcport: ipport1[1],
@@ -232,7 +244,7 @@ export class EventHubSourceService implements Model.IFirewallSource {
           const ipport2 = splitSpaces[4].split(":");
 
           row.time = record.time.toString();
-          row.category = "ApplicationRule";
+          row.category = "AppRule (legacy)";
           row.protocol = splitStops[0].split(" ")[0];
           row.policy ="";
 
@@ -283,7 +295,7 @@ export class EventHubSourceService implements Model.IFirewallSource {
 
           row = {} as Model.FirewallDataRow;
           row.time = record.time.toString();
-          row.category = "DnsProxy";
+          row.category = "DnsProxy (legacy)";
           row.action = split[1].replace(":", "");
           row.sourceip = split[2].split(":")[0];
           row.srcport = split[2].split(":")[1];
@@ -314,7 +326,162 @@ export class EventHubSourceService implements Model.IFirewallSource {
       }
 
     }  catch (err: any) {
-        this.logginService.logEvent(`ERROR in parsing AzureFirewallRule: ${err.toString()} - ${record}`);
+        this.logginService.logEvent(`parseAzureFirewallRuleLegacy: ERROR in parsing AzureFirewallRule: ${err.toString()} - ${record}`);
+        
+        row = {
+          time: record.time.toString(),
+          category: "SKIPPED - ERROR parsing message",
+          protocol: "-",
+          sourceip: "-",
+          srcport: "-",
+          targetip: "-",
+          targetport: "-",
+          action: "-",
+          dataRow: record
+        } as Model.FirewallDataRow;
+    }
+
+    return row;
+  }
+
+  private parseAzureFirewallRule(record: Model.AzureFirewallRecord): Model.FirewallDataRow {
+    var row: Model.FirewallDataRow;
+
+    try {
+      switch (record.category) {
+        case "AZFWDnsQuery": {
+          
+          row = {
+            time: record.time.toString(),
+            category: "AzDnsQuery",
+            protocol: record.properties.Protocol?.toString(),
+            sourceip: record.properties.SourceIp?.toString(),
+            srcport: record.properties.SourcePort?.toString(),
+            targetip: "",
+            targetport: "",
+            action: "Request",
+            policy: "",
+            moreInfo: record.properties.QueryId?.toString() + 
+            " " + record.properties.QueryType?.toString() + 
+            " " + record.properties.QueryClass?.toString() + 
+            " " + record.properties.QueryName?.toString() + 
+            " " + record.properties.ResponseFlags?.toString() + 
+            " " + record.properties.ResponseCode?.toString() + 
+            " " + record.properties.ErrorNumber?.toString() +
+            " " + record.properties.ErrorMessage?.toString(),
+            dataRow: record
+          } as Model.FirewallDataRow; 
+          break; 
+        }
+        case "AZFWApplicationRule": {
+          row = {
+            time: record.time.toString(),
+            category: "ApplicationRule",
+            protocol: record.properties.Protocol?.toString(),
+            sourceip: record.properties.SourceIp?.toString(),
+            srcport: record.properties.SourcePort?.toString(),
+            targetip: record.properties.Fqdn?.toString(),
+            targetport: record.properties.DestinationPort?.toString(),
+            action: record.properties.Action?.toString(),
+            policy: record.properties.Policy?.toString() + " " +
+                    record.properties.RuleCollectionGroup?.toString() + "»" + 
+                    record.properties.RuleCollection?.toString() + "»" + 
+                    record.properties.Rule?.toString(),
+            moreInfo:
+                    "target:"+ record.properties.TargetUrl?.toString() +
+                    " WebCategory:" + record.properties.WebCategory?.toString(),
+                    
+            
+            dataRow: record
+          } as Model.FirewallDataRow;
+          break;
+        } 
+        case "AZFWNetworkRule": {
+          var fullPolicy;
+
+          if (record.properties.RuleCollectionGroup?.toString() != "") {
+            fullPolicy = 
+              record.properties.Policy?.toString() + "»" +
+              record.properties.RuleCollectionGroup?.toString() + "»" + 
+              record.properties.RuleCollection?.toString() + "»" + 
+              record.properties.Rule?.toString();
+          }
+          else {
+            fullPolicy = record.properties.ActionReason?.toString();
+          }
+
+          row = {
+            time: record.time.toString(),
+            category: "NetworkRule",
+            protocol: record.properties.Protocol?.toString(),
+            sourceip: record.properties.SourceIp?.toString(),
+            srcport: record.properties.SourcePort?.toString(),
+            targetip: record.properties.DestinationIp?.toString(),
+            targetport: record.properties.DestinationPort?.toString(),
+            action: record.properties.Action?.toString(),
+            policy: fullPolicy,
+            moreInfo: "",
+          
+            dataRow: record
+          } as Model.FirewallDataRow;
+          break;
+        }
+        case "AZFWNatRule": {
+          var fullPolicy;
+
+          if (record.properties.RuleCollectionGroup?.toString() != "") {
+            fullPolicy = 
+              record.properties.Policy?.toString() + "»" +
+              record.properties.RuleCollectionGroup?.toString() + "»" + 
+              record.properties.RuleCollection?.toString() + "»" + 
+              record.properties.Rule?.toString();
+          }
+          else {
+            fullPolicy = record.properties.ActionReason?.toString();
+          }
+
+          row = {
+            time: record.time.toString(),
+            category: "NATRule",
+            protocol: record.properties.Protocol?.toString(),
+            sourceip: record.properties.SourceIp?.toString(),
+            srcport: record.properties.SourcePort?.toString(),
+            targetip: record.properties.TranslatedIp?.toString(),
+            targetport: record.properties.TranslatedPort?.toString(),
+            policy: fullPolicy,
+            moreInfo: "",
+          
+            dataRow: record
+          } as Model.FirewallDataRow;
+          break;
+        }
+
+
+
+
+
+        
+        default: {
+          row = {
+            time: record.time.toString(),
+            category: "SKIPPED - UNMANAGED Category Name: " + record.category,
+            protocol: "-",
+            sourceip: "-",
+            srcport: "-",
+            targetip: "-",
+            targetport: "-",
+            action: "-",
+            dataRow: record
+          } as Model.FirewallDataRow;
+
+          this.skippedRows++;
+          this.onRowSkipped?.(this.skippedRows);
+          break; 
+        }
+      }
+
+    }  catch (err: any) {
+        this.logginService.logEvent(`parseAzureFirewallRuleLegacy: ERROR in parsing AzureFirewallRule: ${err.toString()} - ${record}`);
         
         row = {
           time: record.time.toString(),
